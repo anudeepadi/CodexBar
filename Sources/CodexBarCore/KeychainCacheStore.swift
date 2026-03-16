@@ -46,13 +46,18 @@ public enum KeychainCacheStore {
             return testResult
         }
         #if os(macOS)
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: self.serviceName,
             kSecAttrAccount as String: key.account,
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
         ]
+        // Prevent the macOS keychain ACL dialog when the CLI binary (a different
+        // binary than the GUI app that originally stored the item) reads cached
+        // data.  Without this, SecItemCopyMatching shows a blocking dialog in
+        // GUI contexts and returns errSecUserCanceled (-128) in headless ones.
+        KeychainNoUIQuery.apply(to: &query)
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -69,6 +74,12 @@ public enum KeychainCacheStore {
             }
             return .found(decoded)
         case errSecItemNotFound:
+            return .missing
+        case errSecInteractionNotAllowed, errSecUserCanceled:
+            // The item exists but belongs to another binary (e.g. GUI app) whose
+            // ACL the CLI binary is not in.  Treat as a cache miss — the CLI will
+            // fall back to a live fetch.
+            self.log.debug("Keychain cache inaccessible without UI (\(key.account)): \(status)")
             return .missing
         default:
             self.log.error("Keychain cache read failed (\(key.account)): \(status)")
@@ -125,14 +136,23 @@ public enum KeychainCacheStore {
             return
         }
         #if os(macOS)
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: self.serviceName,
             kSecAttrAccount as String: key.account,
         ]
+        KeychainNoUIQuery.apply(to: &query)
         let status = SecItemDelete(query as CFDictionary)
         if status != errSecSuccess, status != errSecItemNotFound {
-            self.log.error("Keychain cache delete failed (\(key.account)): \(status)")
+            if status == errSecInteractionNotAllowed || status == errSecUserCanceled
+                || status == -25244 // errSecACLNotSimple — item owned by another binary
+            {
+                // Expected when the CLI tries to invalidate a cache entry that was
+                // written by the GUI app.  Not an error worth logging loudly.
+                self.log.debug("Keychain cache delete skipped — no ACL access (\(key.account)): \(status)")
+            } else {
+                self.log.error("Keychain cache delete failed (\(key.account)): \(status)")
+            }
         }
         #endif
     }

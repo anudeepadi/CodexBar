@@ -24,25 +24,55 @@ from typing import Any, Dict, List
 from urllib.parse import parse_qs, urlparse
 
 
-def run_codexbar_usage_json(binary: str) -> List[Dict[str, Any]]:
+def run_codexbar_usage_json(binary: str, timeout_seconds: int) -> List[Dict[str, Any]]:
     base = shlex.split(binary)
-    cmd = base + ["usage", "--format", "json", "--provider", "all"]
+    cmd = base + ["usage", "--format", "json", "--json-only", "--provider", "all"]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"cli_timeout: CodexBarCLI did not return within 20s ({' '.join(cmd[:4])} ...)") from e
+        raise RuntimeError(
+            f"cli_timeout: CodexBarCLI did not return within {timeout_seconds}s ({' '.join(cmd[:4])} ...)"
+        ) from e
 
-    if p.returncode != 0:
-        raise RuntimeError(f"codexbar usage failed ({p.returncode}): {p.stderr.strip()[:500]}")
     out = p.stdout.strip()
     if not out:
+        # No output at all — only then treat a non-zero exit as a hard error.
+        if p.returncode != 0:
+            raise RuntimeError(f"codexbar usage failed ({p.returncode}): {p.stderr.strip()[:500]}")
         return []
-    data = json.loads(out)
-    if isinstance(data, dict):
-        return [data]
-    if isinstance(data, list):
-        return data
-    return []
+
+    # The CLI can print multiple newline-delimited JSON documents to stdout:
+    #   1. Provider data array (always first)
+    #   2. A CLI-level error array like [{"provider":"cli","error":...}] when
+    #      any provider fails and --format json is active.
+    # We collect every entry from every valid JSON document and drop the
+    # synthetic "cli" error entries which are metadata, not provider data.
+    all_items: List[Dict[str, Any]] = []
+    parse_error = None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            doc = json.loads(line)
+        except json.JSONDecodeError as exc:
+            parse_error = exc
+            continue
+        if isinstance(doc, dict):
+            doc = [doc]
+        if isinstance(doc, list):
+            all_items.extend(doc)
+
+    if not all_items:
+        if p.returncode != 0:
+            raise RuntimeError(f"codexbar usage failed ({p.returncode}): {p.stderr.strip()[:500]}")
+        if parse_error:
+            raise RuntimeError(f"invalid JSON from CLI: {parse_error}") from parse_error
+        return []
+
+    # Filter out CLI-level meta-error entries (provider="cli"); these are not
+    # real usage providers and would produce empty rows in the summary.
+    return [item for item in all_items if item.get("provider") != "cli"]
 
 
 def _extract_numeric(d: Dict[str, Any], candidates: List[str]) -> float:
@@ -212,6 +242,7 @@ def build_timeseries(limit: int = 60) -> Dict[str, Any]:
 
 class Handler(BaseHTTPRequestHandler):
     binary = "codexbar"
+    cli_timeout_seconds = 60
 
     def _write_json(self, status: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -248,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(200, {"ok": True, "source": "history", "ts": datetime.now(timezone.utc).isoformat(), "data": data})
                 return
 
-            raw = run_codexbar_usage_json(self.binary)
+            raw = run_codexbar_usage_json(self.binary, self.cli_timeout_seconds)
             rows = normalize_payload(raw)
             if parsed.path == "/api/usage/summary":
                 data = build_summary(rows, range_name)
@@ -278,12 +309,16 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--binary", default=os.environ.get("CODEXBAR_BIN", "codexbar"))
+    ap.add_argument("--timeout", type=int, default=int(os.environ.get("CODEXBAR_CLI_TIMEOUT", "60")))
     args = ap.parse_args()
+    if args.timeout < 1:
+        ap.error("--timeout must be >= 1")
 
     Handler.binary = args.binary
+    Handler.cli_timeout_seconds = args.timeout
 
     server = HTTPServer((args.host, args.port), Handler)
-    print(f"CodexBar usage API running on http://{args.host}:{args.port}")
+    print(f"CodexBar usage API running on http://{args.host}:{args.port} (CLI timeout: {args.timeout}s)")
     server.serve_forever()
 
 
