@@ -51,6 +51,7 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
     }
 
     var creditsPurchaseWindow: OpenAICreditsPurchaseWindowController?
+    var usageBar: MenuBarUsageBar?
 
     var activeLoginProvider: UsageProvider? {
         didSet {
@@ -81,8 +82,17 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
     private var lastProviderOrder: [UsageProvider]
     private var lastMergeIcons: Bool
     private var lastSwitcherShowsIcons: Bool
+    private var lastObservedUsageBarsShowUsed: Bool
+    /// Tracks which `usageBarsShowUsed` mode the provider switcher was built with.
+    /// Used to decide whether we can "smart update" menu content without rebuilding the switcher.
+    var lastSwitcherUsageBarsShowUsed: Bool
+    /// Tracks whether the merged-menu switcher was built with the Overview tab visible.
+    /// Used to force switcher rebuilds when Overview availability toggles.
+    var lastSwitcherIncludesOverview: Bool = false
     /// Tracks which providers the merged menu's switcher was built with, to detect when it needs full rebuild.
     var lastSwitcherProviders: [UsageProvider] = []
+    /// Tracks which switcher tab state was used for the current merged-menu switcher instance.
+    var lastMergedSwitcherSelection: ProviderSwitcherSelection?
     let loginLogger = CodexBarLog.logger(LogCategories.login)
     var selectedMenuProvider: UsageProvider? {
         get { self.settings.selectedMenuProvider }
@@ -125,8 +135,15 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
             let usedPercent = (primary.usedPercent + secondary.usedPercent) / 2
             return RateWindow(usedPercent: usedPercent, windowMinutes: nil, resetsAt: nil, resetDescription: nil)
         case .automatic:
-            if provider == .factory {
+            if provider == .factory || provider == .kimi {
                 return snapshot?.secondary ?? snapshot?.primary
+            }
+            if provider == .copilot,
+               let primary = snapshot?.primary,
+               let secondary = snapshot?.secondary
+            {
+                // Copilot can expose chat + completions quotas; show the more constrained one by default.
+                return primary.usedPercent >= secondary.usedPercent ? primary : secondary
             }
             return snapshot?.primary ?? snapshot?.secondary
         }
@@ -152,6 +169,8 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
         self.lastProviderOrder = settings.providerOrder
         self.lastMergeIcons = settings.mergeIcons
         self.lastSwitcherShowsIcons = settings.switcherShowsIcons
+        self.lastObservedUsageBarsShowUsed = settings.usageBarsShowUsed
+        self.lastSwitcherUsageBarsShowUsed = settings.usageBarsShowUsed
         self.statusBar = statusBar
         let item = statusBar.statusItem(withLength: NSStatusItem.variableLength)
         // Ensure the icon is rendered at 1:1 without resampling (crisper edges for template images).
@@ -159,6 +178,7 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
         self.statusItem = item
         // Status items for individual providers are now created lazily in updateVisibility()
         super.init()
+        self.usageBar = MenuBarUsageBar(statusBar: statusBar)
         self.wireBindings()
         self.updateIcons()
         self.updateVisibility()
@@ -291,6 +311,11 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
             self.lastSwitcherShowsIcons = showsIcons
             shouldRefresh = true
         }
+        let usageBarsShowUsed = self.settings.usageBarsShowUsed
+        if usageBarsShowUsed != self.lastObservedUsageBarsShowUsed {
+            self.lastObservedUsageBarsShowUsed = usageBarsShowUsed
+            shouldRefresh = true
+        }
         return shouldRefresh
     }
 
@@ -322,6 +347,23 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
         }
         self.updateAnimationState()
         self.updateBlinkingState()
+        self.updateUsageBar()
+    }
+
+    /// Refresh the colored usage-bar status item with the best remaining-percent across all enabled providers.
+    private func updateUsageBar() {
+        let enabled = self.store.enabledProviders()
+        guard !enabled.isEmpty else {
+            self.usageBar?.update(remainingPercent: nil)
+            return
+        }
+        // Pick the lowest remaining percent across enabled providers (show worst-case).
+        let worstRemaining: Double? = enabled.compactMap { provider -> Double? in
+            guard let snapshot = self.store.snapshot(for: provider) else { return nil }
+            let window = snapshot.primary ?? snapshot.secondary
+            return window?.remainingPercent
+        }.min()
+        self.usageBar?.update(remainingPercent: worstRemaining)
     }
 
     /// Lazily retrieves or creates a status item for the given provider
@@ -336,11 +378,10 @@ final class StatusItemController: NSObject, NSMenuDelegate, StatusItemControllin
     }
 
     private func updateVisibility() {
-        let anyEnabled = !self.store.enabledProviders().isEmpty
         let force = self.store.debugForceAnimation
         let mergeIcons = self.shouldMergeIcons
         if mergeIcons {
-            self.statusItem.isVisible = anyEnabled || force
+            self.statusItem.isVisible = true  // Merged icon always visible; fallback menu handles empty state
             for item in self.statusItems.values {
                 item.isVisible = false
             }

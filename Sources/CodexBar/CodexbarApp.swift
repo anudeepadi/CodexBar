@@ -279,6 +279,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        TTYCommandRunner.terminateActiveProcessesForAppShutdown()
+    }
+
     /// Use the classic (non-Liquid Glass) app icon on macOS versions before 26.
     private func configureAppIconForMacOSVersion() {
         if #unavailable(macOS 26) {
@@ -332,5 +336,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             fallbackAccount,
             self.updaterController,
             PreferencesSelection())
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
     }
 }

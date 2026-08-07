@@ -54,6 +54,7 @@ public struct UsageSnapshot: Codable, Sendable {
     public let providerCost: ProviderCostSnapshot?
     public let zaiUsage: ZaiUsageSnapshot?
     public let minimaxUsage: MiniMaxUsageSnapshot?
+    public let openRouterUsage: OpenRouterUsageSnapshot?
     public let cursorRequests: CursorRequestUsage?
     public let updatedAt: Date
     public let identity: ProviderIdentitySnapshot?
@@ -63,6 +64,7 @@ public struct UsageSnapshot: Codable, Sendable {
         case secondary
         case tertiary
         case providerCost
+        case openRouterUsage
         case updatedAt
         case identity
         case accountEmail
@@ -77,6 +79,7 @@ public struct UsageSnapshot: Codable, Sendable {
         providerCost: ProviderCostSnapshot? = nil,
         zaiUsage: ZaiUsageSnapshot? = nil,
         minimaxUsage: MiniMaxUsageSnapshot? = nil,
+        openRouterUsage: OpenRouterUsageSnapshot? = nil,
         cursorRequests: CursorRequestUsage? = nil,
         updatedAt: Date,
         identity: ProviderIdentitySnapshot? = nil)
@@ -87,6 +90,7 @@ public struct UsageSnapshot: Codable, Sendable {
         self.providerCost = providerCost
         self.zaiUsage = zaiUsage
         self.minimaxUsage = minimaxUsage
+        self.openRouterUsage = openRouterUsage
         self.cursorRequests = cursorRequests
         self.updatedAt = updatedAt
         self.identity = identity
@@ -100,6 +104,7 @@ public struct UsageSnapshot: Codable, Sendable {
         self.providerCost = try container.decodeIfPresent(ProviderCostSnapshot.self, forKey: .providerCost)
         self.zaiUsage = nil // Not persisted, fetched fresh each time
         self.minimaxUsage = nil // Not persisted, fetched fresh each time
+        self.openRouterUsage = try container.decodeIfPresent(OpenRouterUsageSnapshot.self, forKey: .openRouterUsage)
         self.cursorRequests = nil // Not persisted, fetched fresh each time
         self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
         if let identity = try container.decodeIfPresent(ProviderIdentitySnapshot.self, forKey: .identity) {
@@ -127,6 +132,7 @@ public struct UsageSnapshot: Codable, Sendable {
         try container.encode(self.secondary, forKey: .secondary)
         try container.encode(self.tertiary, forKey: .tertiary)
         try container.encodeIfPresent(self.providerCost, forKey: .providerCost)
+        try container.encodeIfPresent(self.openRouterUsage, forKey: .openRouterUsage)
         try container.encode(self.updatedAt, forKey: .updatedAt)
         try container.encodeIfPresent(self.identity, forKey: .identity)
         try container.encodeIfPresent(self.identity?.accountEmail, forKey: .accountEmail)
@@ -172,20 +178,26 @@ public struct UsageSnapshot: Codable, Sendable {
         self.identity(for: provider)?.loginMethod
     }
 
-    public func scoped(to provider: UsageProvider) -> UsageSnapshot {
-        guard let identity else { return self }
-        let scopedIdentity = identity.scoped(to: provider)
-        if scopedIdentity.providerID == identity.providerID { return self }
-        return UsageSnapshot(
+    /// Keep this initializer-style copy in sync with UsageSnapshot fields so relabeling/scoping never drops data.
+    public func withIdentity(_ identity: ProviderIdentitySnapshot?) -> UsageSnapshot {
+        UsageSnapshot(
             primary: self.primary,
             secondary: self.secondary,
             tertiary: self.tertiary,
             providerCost: self.providerCost,
             zaiUsage: self.zaiUsage,
             minimaxUsage: self.minimaxUsage,
+            openRouterUsage: self.openRouterUsage,
             cursorRequests: self.cursorRequests,
             updatedAt: self.updatedAt,
-            identity: scopedIdentity)
+            identity: identity)
+    }
+
+    public func scoped(to provider: UsageProvider) -> UsageSnapshot {
+        guard let identity else { return self }
+        let scopedIdentity = identity.scoped(to: provider)
+        if scopedIdentity.providerID == identity.providerID { return self }
+        return self.withIdentity(scopedIdentity)
     }
 }
 
@@ -629,26 +641,36 @@ public struct UsageFetcher: Sendable {
         let authURL = URL(fileURLWithPath: self.environment["CODEX_HOME"] ?? "\(NSHomeDirectory())/.codex")
             .appendingPathComponent("auth.json")
         guard let data = try? Data(contentsOf: authURL),
-              let auth = try? JSONDecoder().decode(AuthFile.self, from: data),
-              let idToken = auth.tokens?.idToken
+              let auth = try? JSONDecoder().decode(AuthFile.self, from: data)
         else {
             return AccountInfo(email: nil, plan: nil)
         }
 
-        guard let payload = UsageFetcher.parseJWT(idToken) else {
-            return AccountInfo(email: nil, plan: nil)
+        // Try OAuth token path first (has email/plan info in JWT)
+        if let idToken = auth.tokens?.idToken {
+            guard let payload = UsageFetcher.parseJWT(idToken) else {
+                return AccountInfo(email: nil, plan: nil)
+            }
+
+            let authDict = payload["https://api.openai.com/auth"] as? [String: Any]
+            let profileDict = payload["https://api.openai.com/profile"] as? [String: Any]
+
+            let plan = (authDict?["chatgpt_plan_type"] as? String)
+                ?? (payload["chatgpt_plan_type"] as? String)
+
+            let email = (payload["email"] as? String)
+                ?? (profileDict?["email"] as? String)
+
+            return AccountInfo(email: email, plan: plan)
         }
 
-        let authDict = payload["https://api.openai.com/auth"] as? [String: Any]
-        let profileDict = payload["https://api.openai.com/profile"] as? [String: Any]
+        // Fall back to API key path (no email/plan info available)
+        if let apiKey = auth.OPENAI_API_KEY, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // API key authentication is valid, but doesn't provide email/plan
+            return AccountInfo(email: "API Key User", plan: nil)
+        }
 
-        let plan = (authDict?["chatgpt_plan_type"] as? String)
-            ?? (payload["chatgpt_plan_type"] as? String)
-
-        let email = (payload["email"] as? String)
-            ?? (profileDict?["email"] as? String)
-
-        return AccountInfo(email: email, plan: plan)
+        return AccountInfo(email: nil, plan: nil)
     }
 
     // MARK: - Helpers
@@ -690,4 +712,10 @@ public struct UsageFetcher: Sendable {
 private struct AuthFile: Decodable {
     struct Tokens: Decodable { let idToken: String? }
     let tokens: Tokens?
+    let OPENAI_API_KEY: String?
+
+    enum CodingKeys: String, CodingKey {
+        case tokens
+        case OPENAI_API_KEY
+    }
 }

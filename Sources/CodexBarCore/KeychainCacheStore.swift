@@ -27,9 +27,15 @@ public enum KeychainCacheStore {
     private static let log = CodexBarLog.logger(LogCategories.keychainCache)
     private static let cacheService = "com.steipete.codexbar.cache"
     private static let cacheLabel = "CodexBar Cache"
-    private nonisolated(unsafe) static var serviceOverride: String?
+    private nonisolated(unsafe) static var globalServiceOverride: String?
+    @TaskLocal private static var serviceOverride: String?
     private static let testStoreLock = NSLock()
-    private nonisolated(unsafe) static var testStore: [Key: Data]?
+    private struct TestStoreKey: Hashable {
+        let service: String
+        let account: String
+    }
+
+    private nonisolated(unsafe) static var testStore: [TestStoreKey: Data]?
     private nonisolated(unsafe) static var testStoreRefCount = 0
 
     public static func load<Entry: Codable>(
@@ -40,13 +46,18 @@ public enum KeychainCacheStore {
             return testResult
         }
         #if os(macOS)
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: self.serviceName,
             kSecAttrAccount as String: key.account,
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
         ]
+        // Prevent the macOS keychain ACL dialog when the CLI binary (a different
+        // binary than the GUI app that originally stored the item) reads cached
+        // data.  Without this, SecItemCopyMatching shows a blocking dialog in
+        // GUI contexts and returns errSecUserCanceled (-128) in headless ones.
+        KeychainNoUIQuery.apply(to: &query)
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -63,6 +74,12 @@ public enum KeychainCacheStore {
             }
             return .found(decoded)
         case errSecItemNotFound:
+            return .missing
+        case errSecInteractionNotAllowed, errSecUserCanceled:
+            // The item exists but belongs to another binary (e.g. GUI app) whose
+            // ACL the CLI binary is not in.  Treat as a cache miss — the CLI will
+            // fall back to a live fetch.
+            self.log.debug("Keychain cache inaccessible without UI (\(key.account)): \(status)")
             return .missing
         default:
             self.log.error("Keychain cache read failed (\(key.account)): \(status)")
@@ -119,20 +136,47 @@ public enum KeychainCacheStore {
             return
         }
         #if os(macOS)
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: self.serviceName,
             kSecAttrAccount as String: key.account,
         ]
+        KeychainNoUIQuery.apply(to: &query)
         let status = SecItemDelete(query as CFDictionary)
         if status != errSecSuccess, status != errSecItemNotFound {
-            self.log.error("Keychain cache delete failed (\(key.account)): \(status)")
+            if status == errSecInteractionNotAllowed || status == errSecUserCanceled
+                || status == -25244 // errSecACLNotSimple — item owned by another binary
+            {
+                // Expected when the CLI tries to invalidate a cache entry that was
+                // written by the GUI app.  Not an error worth logging loudly.
+                self.log.debug("Keychain cache delete skipped — no ACL access (\(key.account)): \(status)")
+            } else {
+                self.log.error("Keychain cache delete failed (\(key.account)): \(status)")
+            }
         }
         #endif
     }
 
     static func setServiceOverrideForTesting(_ service: String?) {
-        self.serviceOverride = service
+        self.globalServiceOverride = service
+    }
+
+    static func withServiceOverrideForTesting<T>(
+        _ service: String?,
+        operation: () throws -> T) rethrows -> T
+    {
+        try self.$serviceOverride.withValue(service) {
+            try operation()
+        }
+    }
+
+    static func withServiceOverrideForTesting<T>(
+        _ service: String?,
+        operation: () async throws -> T) async rethrows -> T
+    {
+        try await self.$serviceOverride.withValue(service) {
+            try await operation()
+        }
     }
 
     static func setTestStoreForTesting(_ enabled: Bool) {
@@ -152,7 +196,7 @@ public enum KeychainCacheStore {
     }
 
     private static var serviceName: String {
-        self.serviceOverride ?? self.cacheService
+        serviceOverride ?? self.globalServiceOverride ?? self.cacheService
     }
 
     private static func makeEncoder() -> JSONEncoder {
@@ -174,7 +218,8 @@ public enum KeychainCacheStore {
         self.testStoreLock.lock()
         defer { self.testStoreLock.unlock() }
         guard let store = self.testStore else { return nil }
-        guard let data = store[key] else { return .missing }
+        let testKey = TestStoreKey(service: self.serviceName, account: key.account)
+        guard let data = store[testKey] else { return .missing }
         let decoder = Self.makeDecoder()
         guard let decoded = try? decoder.decode(Entry.self, from: data) else {
             return .invalid
@@ -188,7 +233,8 @@ public enum KeychainCacheStore {
         guard var store = self.testStore else { return false }
         let encoder = Self.makeEncoder()
         guard let data = try? encoder.encode(entry) else { return true }
-        store[key] = data
+        let testKey = TestStoreKey(service: self.serviceName, account: key.account)
+        store[testKey] = data
         self.testStore = store
         return true
     }
@@ -197,7 +243,8 @@ public enum KeychainCacheStore {
         self.testStoreLock.lock()
         defer { self.testStoreLock.unlock() }
         guard var store = self.testStore else { return false }
-        store.removeValue(forKey: key)
+        let testKey = TestStoreKey(service: self.serviceName, account: key.account)
+        store.removeValue(forKey: testKey)
         self.testStore = store
         return true
     }
